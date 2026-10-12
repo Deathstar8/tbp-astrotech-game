@@ -1,0 +1,93 @@
+// OrbitCompute.compute
+// Each frame: looks up two baked orbit positions per asteroid and lerps between them.
+// No trigonometry — the full Kepler math was precomputed once on the CPU at startup.
+// Only asteroids that pass both distance and frustum tests are appended to the compact
+// buffer; CopyCount writes the visible count into args[1] so the draw call submits
+// exactly that many instances.
+
+#pragma kernel ComputeOrbits
+#pragma kernel WriteInstanceCount
+
+// Must match N_ORBIT_SAMPLES in AsteroidBelt.cs.
+#define N_ORBIT_SAMPLES 16
+
+// {phase0, invPeriod} per asteroid.
+StructuredBuffer<float2> _PhaseData;
+
+// Baked world-space positions in sample-major layout:
+//   _OrbitPositions[s * _AsteroidCount + i] = position of asteroid i at sample s
+StructuredBuffer<float3> _OrbitPositions;
+
+// Compact output: float4 per visible asteroid (xyz = world position, w = scale).
+// LOD0 = close asteroids (full mesh), LOD1 = far asteroids (billboard quad).
+AppendStructuredBuffer<float4> _MatricesLOD0;
+AppendStructuredBuffer<float4> _MatricesLOD1;
+
+// WriteInstanceCount bridge (see kernel below)
+StructuredBuffer<uint> _VisibleCount;
+RWByteAddressBuffer    _ArgBuffer;
+
+int    _AsteroidCount;
+float  _Time;
+float3 _CameraPos;
+float  _MaxRenderDist;
+float  _LODDistance;
+
+// Six frustum planes in world space (Gribb-Hartmann, unnormalized).
+// Point P is inside plane i when: dot(_FrustumPlanes[i].xyz, P) + _FrustumPlanes[i].w >= 0
+float4 _FrustumPlanes[6];
+
+static const float ASTEROID_SCALE = 0.05;
+
+bool InsideFrustum(float3 pos)
+{
+    for (int i = 0; i < 6; i++)
+        if (dot(_FrustumPlanes[i].xyz, pos) + _FrustumPlanes[i].w < 0.0)
+            return false;
+    return true;
+}
+
+[numthreads(64, 1, 1)]
+void ComputeOrbits(uint3 id : SV_DispatchThreadID)
+{
+    int idx = (int)id.x;
+    if (idx >= _AsteroidCount) return;
+
+    float2 phase = _PhaseData[idx];
+
+    // Fractional position in orbit [0, 1) — no trig, just float arithmetic
+    float fraction = frac(phase.x + _Time * phase.y);
+    float sampleF  = fraction * N_ORBIT_SAMPLES;
+    uint  s0       = (uint)sampleF;
+    uint  s1       = (s0 + 1u) % (uint)N_ORBIT_SAMPLES;
+
+    // Sample-major indexing: coalesced reads across the warp
+    float3 pos = lerp(
+        _OrbitPositions[s0 * _AsteroidCount + idx],
+        _OrbitPositions[s1 * _AsteroidCount + idx],
+        frac(sampleF));
+
+    // Distance cull first (cheap), then frustum cull
+    float dist = length(pos - _CameraPos);
+    if (dist <= _MaxRenderDist && InsideFrustum(pos))
+    {
+        if (dist <= _LODDistance)
+            _MatricesLOD0.Append(float4(pos, ASTEROID_SCALE));
+        else
+        {
+            // Scale proportional to distance so the billboard subtends a roughly constant
+            // screen-space angle. At exactly _LODDistance the scale matches LOD0 (seamless
+            // transition); further asteroids grow to stay visible at the edge of the belt.
+            float billboardScale = ASTEROID_SCALE * (dist / _LODDistance);
+            _MatricesLOD1.Append(float4(pos, billboardScale));
+        }
+    }
+}
+
+// Writes the visible instance count from _VisibleCount (ComputeBuffer, set by CopyCount)
+// into the instanceCount field of the GraphicsBuffer args at byte offset 4.
+[numthreads(1, 1, 1)]
+void WriteInstanceCount(uint3 id : SV_DispatchThreadID)
+{
+    _ArgBuffer.Store(4, _VisibleCount[0]);
+}
